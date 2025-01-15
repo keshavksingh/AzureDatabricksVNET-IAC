@@ -10,7 +10,7 @@ LOCATION = "uksouth"
 WORKSPACE_NAME = "adbworkspacedev01"
 DATABRICKS_WORKSPACE_URL = "https://adb-<>.<>.azuredatabricks.net"
 JAR_STORAGE_ACCOUNT = "adlsstoragedev01"
-TENANT_ID = "b8aa6860-fe59-441c-9e19-d95161e380d8"
+TENANT_ID = "<>"
 
 # Azure Clients
 credential = DefaultAzureCredential()
