@@ -12,7 +12,11 @@ using Azure.ResourceManager.Resources;
 using Azure.ResourceManager.Resources.Models;
 using Azure.ResourceManager.Network;
 using Azure.ResourceManager.Network.Models;
-
+using Azure.ResourceManager.Storage;
+using Microsoft.Azure.Databricks.Client;
+using Microsoft.Azure.Databricks.Client.Models;
+using Azure.ResourceManager.Authorization;
+using Azure.ResourceManager.Authorization.Models;
 using Azure.Core;
 
 namespace VNET_IAC
@@ -21,17 +25,42 @@ namespace VNET_IAC
     {
         static async Task Main(string[] args)
         {
+            
             await DatabricksVNETProvisioning.Run(args);
+            var databricksHelper = new DatabricksHelper("<SubsId>", "adcsqueryvnetrg", "adbcsworkspacedev01");
+            string principalId = await databricksHelper.GetDatabricksManagedIdentityPrincipalIdAsync();
+            Guid principalGuid = Guid.Parse(principalId);
+            Console.WriteLine($"Managed Identity Principal ID: {principalId}");
+
+            string subscriptionId = "<SubsId>";
+            string resourceGroup = "adcsqueryvnetrg";
+            string storageAccountName = "<ADLSGen2Name>";
+            string storageAccountScope = $"/subscriptions/{subscriptionId}/resourceGroups/{resourceGroup}/providers/Microsoft.Storage/storageAccounts/{storageAccountName}";
+            var roleHelper = new RoleAssignmentHelper(subscriptionId);
+            try
+            {
+                await roleHelper.AssignRoleToServicePrincipalAsync(principalGuid, storageAccountScope);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: {ex.Message}");
+            }
+
+            string databricksWorkspaceUrl = "https://adb-<>.<>.azuredatabricks.net";
+            string aadToken = DatabricksClusterHelper.GetAzureADToken();
+            var databricksHelper = new DatabricksClusterHelper(databricksWorkspaceUrl, aadToken);
+            string clusterId = await databricksHelper.CreateClusterAsync();
+            Console.WriteLine($"Cluster successfully created with ID: {clusterId}");
         }
     }
 
     class DatabricksVNETProvisioning
     {
         // Constants
-        private static string SUBSCRIPTION_ID = "<subsId>;
-        private static string RESOURCE_GROUP = "adcsqueryvnetrg";
+        private static string SUBSCRIPTION_ID = "<>";
+        private static string RESOURCE_GROUP = "<ResourceGroupName>";
         private static string LOCATION = "uksouth";
-        private static string WORKSPACE_NAME = "adbcsworkspacedev01";
+        private static string WORKSPACE_NAME = "<ADBWSName>";
         private static string VNET_NAME = "adbcsdevqueryvnet";
         private static string VNET_ID = $"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/{VNET_NAME}";
         private static string PUBLIC_SUBNET_NAME = "databricks-public-subnet";
@@ -475,5 +504,169 @@ namespace VNET_IAC
 
 
     }
+
+    public class DatabricksHelper
+    {
+        private static string SUBSCRIPTION_ID = "<>";
+        private static string RESOURCE_GROUP = "<>";
+        private static string WORKSPACE_NAME = "<>";
+        private readonly ArmClient _armClient;
+
+        public DatabricksHelper(string SUBSCRIPTION_ID, string RESOURCE_GROUP, string WORKSPACE_NAME)
+        {
+        // Initialize the Azure ARM Client using DefaultAzureCredential
+        _armClient = new ArmClient(new DefaultAzureCredential(), SUBSCRIPTION_ID);
+        }
+
+        public async Task<string> GetDatabricksManagedIdentityPrincipalIdAsync()
+        {
+            try
+            {
+                Console.WriteLine("Retrieving Databricks Managed Identity Principal ID...");
+                var resourceGroup = _armClient.GetResourceGroupResource(
+                    new ResourceIdentifier($"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}")
+                );
+
+                string workspaceResourceId = $"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}/providers/Microsoft.Databricks/workspaces/{WORKSPACE_NAME}";
+                var workspaceResource = await _armClient.GetGenericResource(new ResourceIdentifier(workspaceResourceId)).GetAsync();
+
+                var workspaceProperties = workspaceResource.Value.Data.Properties.ToObjectFromJson<Dictionary<string, object>>();
+                if (workspaceProperties.TryGetValue("managedResourceGroupId", out var managedResourceGroupId))
+                {
+                    string managedResourceGroupName = managedResourceGroupId.ToString().Split('/').Last();
+                    Console.WriteLine($"Managed Resource Group Name: {managedResourceGroupName}");
+                    var managedIdentityResourceId = $"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{managedResourceGroupName}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/dbmanagedidentity";
+                    var managedIdentityResource = await _armClient.GetGenericResource(new ResourceIdentifier(managedIdentityResourceId)).GetAsync();
+                    var managedIdentityProperties = managedIdentityResource.Value.Data.Properties.ToObjectFromJson<Dictionary<string, object>>();
+                    if (managedIdentityProperties != null && managedIdentityProperties.TryGetValue("principalId", out var principalId))
+                    {
+                        return principalId?.ToString() ?? throw new InvalidOperationException("Principal ID is null.");
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException("Failed to retrieve the Managed Identity Principal ID.");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("managedResourceGroupId not found in workspace properties.");
+                    return null;
+                }
+            }
+            catch (RequestFailedException ex)
+            {
+                Console.WriteLine($"Azure Request Error: {ex.Message}");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"General Error: {ex.Message}");
+                throw new InvalidOperationException("An error occurred while retrieving the Managed Identity Principal ID.", ex);
+            }
+        }
+
+
+
+    }
+
+    public class RoleAssignmentHelper
+    {
+        private readonly ArmClient _armClient;
+        private readonly string _subscriptionId;
+
+        // Predefined Role Definition ID for "Storage Blob Data Contributor"
+        private const string StorageBlobDataContributorRoleId = "ba92f5b4-2d11-453d-a403-e96b0029c9fe";
+
+        public RoleAssignmentHelper(string subscriptionId)
+        {
+            _subscriptionId = subscriptionId;
+            _armClient = new ArmClient(new DefaultAzureCredential(), _subscriptionId);
+        }
+        public async Task AssignRoleToServicePrincipalAsync(Guid principalId, string scopePath, string roleDefinitionId = StorageBlobDataContributorRoleId)
+        {
+            try
+            {
+                var roleName = StorageBlobDataContributorRoleId;
+                Console.WriteLine($"Assigning role '{roleDefinitionId}' to principal '{principalId}' on scope '{scopePath}'...");
+                var roleDefId = $"/subscriptions/{_subscriptionId}/providers/Microsoft.Authorization/roleDefinitions/{roleName}";
+                var roleAssignmentResourceId = RoleAssignmentResource.CreateResourceIdentifier(scopePath, Guid.NewGuid().ToString());
+                var roleAssignmentResource = _armClient.GetRoleAssignmentResource(roleAssignmentResourceId);
+
+                var roleAssignmentContent = new RoleAssignmentCreateOrUpdateContent(new ResourceIdentifier(roleDefId), principalId)
+                {
+                    PrincipalType = RoleManagementPrincipalType.ServicePrincipal
+                };
+                
+                await roleAssignmentResource.UpdateAsync(WaitUntil.Completed, roleAssignmentContent);
+
+                Console.WriteLine($"Successfully assigned role to principal '{principalId}' on scope '{scopePath}'.");
+            }
+            catch (RequestFailedException ex)
+            {
+                Console.WriteLine($"Azure request failed: {ex.Message}");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"An error occurred: {ex.Message}");
+                throw;
+            }
+        }
+    }
+
+    public class DatabricksClusterHelper
+    {
+        private readonly DatabricksClient _databricksClient;
+
+        // Constructor initializes the Databricks Client
+        public DatabricksClusterHelper(string databricksWorkspaceUrl, string aadAccessToken)
+        {
+            _databricksClient = DatabricksClient.CreateClient(databricksWorkspaceUrl, aadAccessToken);
+        }
+
+        // Method to create a Databricks cluster
+        public async Task<string> CreateClusterAsync()
+        {
+            Console.WriteLine("Creating Databricks cluster...");
+
+            // Cluster configuration
+            var clusterConfig = ClusterAttributes
+                .GetNewClusterConfiguration("StandardCluster")
+                .WithRuntimeVersion("16.1.x-scala2.12")
+                .WithAutoScale(2, 4)
+                .WithAutoTermination(30)
+                .WithNodeType("Standard_D4ds_v5")
+                .WithClusterMode(ClusterMode.Standard);
+
+            // Set Spark configuration using the property instead of method
+            clusterConfig.SparkConfiguration = new Dictionary<string, string>{{ "spark.databricks.delta.preview.enabled", "true" }};
+            var libraries = new List<Library> { new MavenLibrary { MavenLibrarySpec = new MavenLibrarySpec { Coordinates = "com.databricks:databricks-jdbc:2.6.40" } } };
+
+            try
+            {
+                // Create the cluster
+                var clusterId = await _databricksClient.Clusters.Create(clusterConfig);
+                Console.WriteLine("Cluster created successfully!");
+                Console.WriteLine($"Cluster ID: {clusterId}");
+                return clusterId;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Failed to create cluster.");
+                Console.WriteLine($"Error: {ex.Message}");
+                throw;
+            }
+        }
+
+        // Method to get the Azure AD token (if needed separately)
+        public static string GetAzureADToken()
+        {
+            var credential = new Azure.Identity.DefaultAzureCredential();
+            var tokenRequestContext = new Azure.Core.TokenRequestContext(new[] { "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default" });
+            var token = credential.GetToken(tokenRequestContext);
+            return token.Token;
+        }
+    }
+
 
 }
