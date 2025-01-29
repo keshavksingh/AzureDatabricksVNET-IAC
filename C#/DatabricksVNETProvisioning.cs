@@ -22,6 +22,7 @@ using Newtonsoft.Json;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Net.Http;
 
 namespace VNET_IAC
 {
@@ -29,18 +30,18 @@ namespace VNET_IAC
     {
         static async Task Main(string[] args)
         {
-            
+
             await DatabricksVNETProvisioning.Run(args);
-            var databricksHelper = new DatabricksHelper("<SUBS_ID>", "<RG>", "<ADB_WS_NAME>");
+            var databricksHelper = new DatabricksHelper("<SubscriptionID>", "<ResourceGroupName>", "<ADBWorkspaceName>");
             (string principalId, string clientId) = await databricksHelper.GetDatabricksManagedIdentityPrincipalIdAsync();
             Guid principalGuid = Guid.Parse(principalId);
             Console.WriteLine($"Managed Identity Principal ID: {principalId}");
             Guid clientIdGuid = Guid.Parse(clientId);
             Console.WriteLine($"Managed Identity Client ID: {clientId}");
 
-            string subscriptionId = "<SUBS_ID>";
-            string resourceGroup = "<RG>";
-            string storageAccountName = "shared_adlsgen2_Name";
+            string subscriptionId = "<SubscriptionID>";
+            string resourceGroup = "adcsqueryvnetrg";
+            string storageAccountName = "adlsgen2csdevqueryvnet";
             string storageAccountScope = $"/subscriptions/{subscriptionId}/resourceGroups/{resourceGroup}/providers/Microsoft.Storage/storageAccounts/{storageAccountName}";
             
             var roleHelper = new RoleAssignmentHelper(subscriptionId);
@@ -53,7 +54,7 @@ namespace VNET_IAC
                 Console.WriteLine($"Error: {ex.Message}");
             }
             
-            string TenantId = "<TENANT_ID>";
+            string TenantId = "<TenantId>";
             string databricksWorkspaceUrl = "https://adb-<>.<>.azuredatabricks.net";
             string aadToken = DatabricksClusterHelper.GetAzureADToken();
             var databricksClusterHelper = new DatabricksClusterHelper(databricksWorkspaceUrl, aadToken);
@@ -62,8 +63,8 @@ namespace VNET_IAC
 
             //Create Databricks Job
             string databricksToken = aadToken;
-            string jarPath = "abfss://jarcontainer@<storageaccount>.dfs.core.windows.net/jardir/<jar>-assembly-1.1.jar";
-            string mainClassName = "com.microsoft.<>.<>.MainApp";
+            string jarPath = "abfss://jarcontainer@<StorageAccountName>.dfs.core.windows.net/jardir/<>-assembly-1.1.jar";
+            string mainClassName = "com.<>.<>.<>.MainApp";
 
             DatabricksCreateJobHelper jobHelper = new DatabricksCreateJobHelper(databricksToken, databricksWorkspaceUrl);
             string jobId = await jobHelper.CreateJobAsync(clusterId, jarPath, mainClassName);
@@ -76,8 +77,11 @@ namespace VNET_IAC
             {
                 Console.WriteLine("Failed to create job.");
             }
-
-            //string jobId = "296921761618670";
+            
+            string databricksWorkspaceUrl = "https://adb-<>.<>.azuredatabricks.net";
+            string aadToken = DatabricksClusterHelper.GetAzureADToken();
+            string databricksToken = aadToken;
+            string jobId = "637039688390876";
             var parameters = new Dictionary<string, string>
                                 {
                                     { "param1", "value1" },
@@ -86,6 +90,7 @@ namespace VNET_IAC
             
             var runJobHelper = new DatabricksRunJobHelper(databricksToken, databricksWorkspaceUrl);
             string? runId = await runJobHelper.RunJobAsync(jobId, parameters);
+            //string? runId = await runJobHelper.RunJobAsync(jobId);
 
             if (!string.IsNullOrEmpty(runId))
             {
@@ -95,8 +100,8 @@ namespace VNET_IAC
             {
                 Console.WriteLine("Job run failed.");
             }
-            
-            string jobRunId = "844368691789134"; // Replace with actual job run ID
+
+            string jobRunId = "1049248823359402"; // Replace with actual job run ID
 
             var jobTaskHelper = new DatabricksJobTaskHelper(databricksToken, databricksWorkspaceUrl);
             var output = await jobTaskHelper.GetJobTaskOutputAsync(jobRunId);
@@ -109,17 +114,28 @@ namespace VNET_IAC
             {
                 Console.WriteLine("Failed to retrieve job task output.");
             }
+            */
+            var activeSessionHelper = new DatabricksListJobsHelper(databricksToken, databricksWorkspaceUrl);
+            int activeSessions = await activeSessionHelper.FetchLatestJobRunsAsync(jobId);
+            if (activeSessions >= 0)
+            {
+                Console.WriteLine($"Number of active Spark sessions: {activeSessions}");
+            }
+            else
+            {
+                Console.WriteLine($"Failed to retrieve active Spark sessions. {activeSessions}");
+            }
         }
     }
 
     class DatabricksVNETProvisioning
     {
         // Constants
-        private static string SUBSCRIPTION_ID = "";
-        private static string RESOURCE_GROUP = "";
+        private static string SUBSCRIPTION_ID = "<SubscriptionID>";
+        private static string RESOURCE_GROUP = "<ResourceGroupName>";
         private static string LOCATION = "uksouth";
-        private static string WORKSPACE_NAME = "";
-        private static string VNET_NAME = "";
+        private static string WORKSPACE_NAME = "<ADBWorkspaceName>";
+        private static string VNET_NAME = "adbcsdevqueryvnet";
         private static string VNET_ID = $"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/{VNET_NAME}";
         private static string PUBLIC_SUBNET_NAME = "databricks-public-subnet";
         private static string PRIVATE_SUBNET_NAME = "databricks-private-subnet";
@@ -565,9 +581,9 @@ namespace VNET_IAC
 
     public class DatabricksHelper
     {
-        private static string SUBSCRIPTION_ID = "27ef0436-f648-4bad-be15-3e872e16318b";
-        private static string RESOURCE_GROUP = "adcsqueryvnetrg";
-        private static string WORKSPACE_NAME = "adbcsworkspacedev01";
+        private static string SUBSCRIPTION_ID = "<SubscriptionID>";
+        private static string RESOURCE_GROUP = "<ResourceGroupName>";
+        private static string WORKSPACE_NAME = "<ADBWorkspaceName>";
         private readonly ArmClient _armClient;
 
         public DatabricksHelper(string SUBSCRIPTION_ID, string RESOURCE_GROUP, string WORKSPACE_NAME)
@@ -1011,6 +1027,88 @@ namespace VNET_IAC
                 }
             }
         }
+
+    public class DatabricksListJobsHelper
+    {
+        private readonly HttpClient _httpClient;
+        private readonly string _databricksWorkspaceUrl;
+        private readonly string _databricksToken;
+        private const int MaxRunsToFetch = 150; // Target number of job runs
+        private const int PageSize = 24; // Fetching 24 per request for max efficiency
+
+        public DatabricksListJobsHelper(string databricksToken, string databricksWorkspaceUrl)
+        {
+            _httpClient = new HttpClient();
+            _databricksToken = databricksToken;
+            _databricksWorkspaceUrl = databricksWorkspaceUrl;
+            _httpClient.DefaultRequestHeaders.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _databricksToken);
+        }
+
+        public async Task<int> FetchLatestJobRunsAsync(string jobId)
+        {
+            try
+            {
+                List<JsonElement> allRuns = new List<JsonElement>();
+                string nextPageToken = null;
+
+                while (allRuns.Count < MaxRunsToFetch)
+                {
+                    string requestUrl = $"{_databricksWorkspaceUrl}/api/2.1/jobs/runs/list?job_id={jobId}&limit={PageSize}";
+                    if (!string.IsNullOrEmpty(nextPageToken))
+                    {
+                        requestUrl += $"&page_token={nextPageToken}";
+                    }
+
+                    HttpResponseMessage response = await _httpClient.GetAsync(requestUrl);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine($"Error: {response.StatusCode}");
+                        return -1;
+                    }
+
+                    string jsonResponse = await response.Content.ReadAsStringAsync();
+                    JsonDocument jsonDoc = JsonDocument.Parse(jsonResponse);
+
+                    if (jsonDoc.RootElement.TryGetProperty("runs", out JsonElement runsElement))
+                    {
+                        foreach (JsonElement run in runsElement.EnumerateArray())
+                        {
+                            allRuns.Add(run);
+                            if (allRuns.Count >= MaxRunsToFetch) break; // Stop if we reach 150 runs
+                        }
+                    }
+                    // Check for next page token
+                    if (jsonDoc.RootElement.TryGetProperty("next_page_token", out JsonElement nextPageTokenElement))
+                    {
+                        nextPageToken = nextPageTokenElement.GetString();
+                        if (string.IsNullOrEmpty(nextPageToken)) break; // Stop if no more pages
+                    }
+                    else
+                    {
+                        break; // Stop if no next page token
+                    }
+                }
+                Console.WriteLine($"Fetched {allRuns.Count} job runs:");
+                foreach (var run in allRuns)
+                {
+                    string runId = run.GetProperty("run_id").ToString();
+                    string state = run.GetProperty("state").GetProperty("life_cycle_state").ToString();
+                    string status = run.GetProperty("state").TryGetProperty("result_state", out JsonElement resultStateElement)
+                                    ? resultStateElement.ToString()
+                                    : "UNKNOWN";
+                    Console.WriteLine($"Run ID: {runId}, State: {state}, Status: {status}");
+                }
+
+                return allRuns.Count;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error fetching job runs: {ex.Message}");
+                return -1;
+            }
+        }
+    }
 
 
 }
