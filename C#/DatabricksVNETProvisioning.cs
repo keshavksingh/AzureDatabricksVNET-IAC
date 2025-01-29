@@ -18,6 +18,10 @@ using Microsoft.Azure.Databricks.Client.Models;
 using Azure.ResourceManager.Authorization;
 using Azure.ResourceManager.Authorization.Models;
 using Azure.Core;
+using Newtonsoft.Json;
+using System.Net.Http.Headers;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace VNET_IAC
 {
@@ -27,15 +31,18 @@ namespace VNET_IAC
         {
             
             await DatabricksVNETProvisioning.Run(args);
-            var databricksHelper = new DatabricksHelper("<SubsId>", "adcsqueryvnetrg", "adbcsworkspacedev01");
-            string principalId = await databricksHelper.GetDatabricksManagedIdentityPrincipalIdAsync();
+            var databricksHelper = new DatabricksHelper("<SUBS_ID>", "<RG>", "<ADB_WS_NAME>");
+            (string principalId, string clientId) = await databricksHelper.GetDatabricksManagedIdentityPrincipalIdAsync();
             Guid principalGuid = Guid.Parse(principalId);
             Console.WriteLine($"Managed Identity Principal ID: {principalId}");
+            Guid clientIdGuid = Guid.Parse(clientId);
+            Console.WriteLine($"Managed Identity Client ID: {clientId}");
 
-            string subscriptionId = "<SubsId>";
-            string resourceGroup = "adcsqueryvnetrg";
-            string storageAccountName = "<ADLSGen2Name>";
+            string subscriptionId = "<SUBS_ID>";
+            string resourceGroup = "<RG>";
+            string storageAccountName = "shared_adlsgen2_Name";
             string storageAccountScope = $"/subscriptions/{subscriptionId}/resourceGroups/{resourceGroup}/providers/Microsoft.Storage/storageAccounts/{storageAccountName}";
+            
             var roleHelper = new RoleAssignmentHelper(subscriptionId);
             try
             {
@@ -45,23 +52,74 @@ namespace VNET_IAC
             {
                 Console.WriteLine($"Error: {ex.Message}");
             }
-
+            
+            string TenantId = "<TENANT_ID>";
             string databricksWorkspaceUrl = "https://adb-<>.<>.azuredatabricks.net";
             string aadToken = DatabricksClusterHelper.GetAzureADToken();
-            var databricksHelper = new DatabricksClusterHelper(databricksWorkspaceUrl, aadToken);
-            string clusterId = await databricksHelper.CreateClusterAsync();
+            var databricksClusterHelper = new DatabricksClusterHelper(databricksWorkspaceUrl, aadToken);
+            string clusterId = await databricksClusterHelper.CreateClusterAsync(storageAccountName, clientId, TenantId);
             Console.WriteLine($"Cluster successfully created with ID: {clusterId}");
+
+            //Create Databricks Job
+            string databricksToken = aadToken;
+            string jarPath = "abfss://jarcontainer@<storageaccount>.dfs.core.windows.net/jardir/<jar>-assembly-1.1.jar";
+            string mainClassName = "com.microsoft.<>.<>.MainApp";
+
+            DatabricksCreateJobHelper jobHelper = new DatabricksCreateJobHelper(databricksToken, databricksWorkspaceUrl);
+            string jobId = await jobHelper.CreateJobAsync(clusterId, jarPath, mainClassName);
+
+            if (!string.IsNullOrEmpty(jobId))
+            {
+                Console.WriteLine($"Job created successfully with ID: {jobId}");
+            }
+            else
+            {
+                Console.WriteLine("Failed to create job.");
+            }
+
+            //string jobId = "296921761618670";
+            var parameters = new Dictionary<string, string>
+                                {
+                                    { "param1", "value1" },
+                                    { "param2", "value2" }
+                                };
+            
+            var runJobHelper = new DatabricksRunJobHelper(databricksToken, databricksWorkspaceUrl);
+            string? runId = await runJobHelper.RunJobAsync(jobId, parameters);
+
+            if (!string.IsNullOrEmpty(runId))
+            {
+                Console.WriteLine($"Job started successfully with Run ID: {runId}");
+            }
+            else
+            {
+                Console.WriteLine("Job run failed.");
+            }
+            
+            string jobRunId = "844368691789134"; // Replace with actual job run ID
+
+            var jobTaskHelper = new DatabricksJobTaskHelper(databricksToken, databricksWorkspaceUrl);
+            var output = await jobTaskHelper.GetJobTaskOutputAsync(jobRunId);
+
+            if (output != null)
+            {
+                Console.WriteLine("Job task output retrieved successfully.");
+            }
+            else
+            {
+                Console.WriteLine("Failed to retrieve job task output.");
+            }
         }
     }
 
     class DatabricksVNETProvisioning
     {
         // Constants
-        private static string SUBSCRIPTION_ID = "<>";
-        private static string RESOURCE_GROUP = "<ResourceGroupName>";
+        private static string SUBSCRIPTION_ID = "";
+        private static string RESOURCE_GROUP = "";
         private static string LOCATION = "uksouth";
-        private static string WORKSPACE_NAME = "<ADBWSName>";
-        private static string VNET_NAME = "adbcsdevqueryvnet";
+        private static string WORKSPACE_NAME = "";
+        private static string VNET_NAME = "";
         private static string VNET_ID = $"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/{VNET_NAME}";
         private static string PUBLIC_SUBNET_NAME = "databricks-public-subnet";
         private static string PRIVATE_SUBNET_NAME = "databricks-private-subnet";
@@ -507,9 +565,9 @@ namespace VNET_IAC
 
     public class DatabricksHelper
     {
-        private static string SUBSCRIPTION_ID = "<>";
-        private static string RESOURCE_GROUP = "<>";
-        private static string WORKSPACE_NAME = "<>";
+        private static string SUBSCRIPTION_ID = "27ef0436-f648-4bad-be15-3e872e16318b";
+        private static string RESOURCE_GROUP = "adcsqueryvnetrg";
+        private static string WORKSPACE_NAME = "adbcsworkspacedev01";
         private readonly ArmClient _armClient;
 
         public DatabricksHelper(string SUBSCRIPTION_ID, string RESOURCE_GROUP, string WORKSPACE_NAME)
@@ -518,7 +576,7 @@ namespace VNET_IAC
         _armClient = new ArmClient(new DefaultAzureCredential(), SUBSCRIPTION_ID);
         }
 
-        public async Task<string> GetDatabricksManagedIdentityPrincipalIdAsync()
+        public async Task<(string,string)> GetDatabricksManagedIdentityPrincipalIdAsync()
         {
             try
             {
@@ -538,9 +596,12 @@ namespace VNET_IAC
                     var managedIdentityResourceId = $"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{managedResourceGroupName}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/dbmanagedidentity";
                     var managedIdentityResource = await _armClient.GetGenericResource(new ResourceIdentifier(managedIdentityResourceId)).GetAsync();
                     var managedIdentityProperties = managedIdentityResource.Value.Data.Properties.ToObjectFromJson<Dictionary<string, object>>();
-                    if (managedIdentityProperties != null && managedIdentityProperties.TryGetValue("principalId", out var principalId))
+                    if (managedIdentityProperties != null && managedIdentityProperties.TryGetValue("principalId", out var principalId) && managedIdentityProperties.TryGetValue("clientId", out var clientId))
                     {
-                        return principalId?.ToString() ?? throw new InvalidOperationException("Principal ID is null.");
+                        var principalIdStr = principalId?.ToString() ?? throw new InvalidOperationException("Principal ID is null.");
+                        var clientIdStr = clientId?.ToString() ?? throw new InvalidOperationException("Client ID is null.");
+
+                        return (principalIdStr, clientIdStr);
                     }
                     else
                     {
@@ -550,7 +611,7 @@ namespace VNET_IAC
                 else
                 {
                     Console.WriteLine("managedResourceGroupId not found in workspace properties.");
-                    return null;
+                    return (string.Empty, string.Empty);
                 }
             }
             catch (RequestFailedException ex)
@@ -625,7 +686,7 @@ namespace VNET_IAC
         }
 
         // Method to create a Databricks cluster
-        public async Task<string> CreateClusterAsync()
+        public async Task<string> CreateClusterAsync(string StorageAccount, string ClientId, string TenantId)
         {
             Console.WriteLine("Creating Databricks cluster...");
 
@@ -639,7 +700,10 @@ namespace VNET_IAC
                 .WithClusterMode(ClusterMode.Standard);
 
             // Set Spark configuration using the property instead of method
-            clusterConfig.SparkConfiguration = new Dictionary<string, string>{{ "spark.databricks.delta.preview.enabled", "true" }};
+            clusterConfig.SparkConfiguration = new Dictionary<string, string>{{ "spark.hadoop.fs.azure.account.oauth2.client.id", $"{ClientId}" }
+                ,{ $"spark.hadoop.fs.azure.account.oauth.provider.type.{StorageAccount}.dfs.core.windows.net", "org.apache.hadoop.fs.azurebfs.oauth2.MsiTokenProvider" }
+                ,{ "spark.hadoop.fs.azure.account.oauth2.msi.tenant", $"{TenantId}" }
+                ,{ $"spark.hadoop.fs.azure.account.auth.type.{StorageAccount}.dfs.core.windows.net", "OAuth" } };
             var libraries = new List<Library> { new MavenLibrary { MavenLibrarySpec = new MavenLibrarySpec { Coordinates = "com.databricks:databricks-jdbc:2.6.40" } } };
 
             try
@@ -667,6 +731,286 @@ namespace VNET_IAC
             return token.Token;
         }
     }
+    public class DatabricksCreateJobHelper
+    {
+        private readonly HttpClient _httpClient;
+        private readonly string _databricksWorkspaceUrl;
+        private readonly string _databricksToken;
+
+        public DatabricksCreateJobHelper(string databricksToken, string databricksWorkspaceUrl)
+        {
+            _httpClient = new HttpClient();
+            _databricksToken = databricksToken;
+            _databricksWorkspaceUrl = databricksWorkspaceUrl;
+        }
+
+        public async Task<string?> CreateJobAsync(string clusterId, string jarPath, string mainClassName)
+        {
+            Console.WriteLine("Creating Databricks job...");
+            var jobConfig = new
+            {
+                name = "SparkJarJob",
+                tasks = new[]
+                {
+            new
+            {
+                task_key = "Task",
+                description = "A Spark JAR task running on an existing cluster",
+                existing_cluster_id = clusterId,
+                spark_jar_task = new
+                {
+                    main_class_name = mainClassName
+                },
+                libraries = new[]
+                {
+                    new
+                    {
+                        jar = jarPath
+                    }
+                }
+            }
+        }
+            };
+
+            var requestUri = $"{_databricksWorkspaceUrl}/api/2.1/jobs/create";
+            var jsonContent = System.Text.Json.JsonSerializer.Serialize(jobConfig);
+            var httpContent = new StringContent(jsonContent, Encoding.UTF8, "application/json");
+
+            _httpClient.DefaultRequestHeaders.Clear();
+            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _databricksToken);
+
+            try
+            {
+                var response = await _httpClient.PostAsync(requestUri, httpContent);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    Console.WriteLine("Job created successfully!");
+                    var responseBody = await response.Content.ReadAsStringAsync();
+                    var responseJson = System.Text.Json.JsonDocument.Parse(responseBody);
+                    var jobId = responseJson.RootElement.GetProperty("job_id");
+
+                    Console.WriteLine($"Job ID: {jobId.ToString()}");
+                    return jobId.ToString();
+                }
+                else
+                {
+                    Console.WriteLine("Failed to create job.");
+                    Console.WriteLine($"Status Code: {response.StatusCode}");
+                    Console.WriteLine($"Response: {await response.Content.ReadAsStringAsync()}");
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error while creating Databricks job: {ex.Message}");
+                throw;
+            }
+        }
+    }
+
+    public class DatabricksRunJobHelper
+    {
+        private readonly HttpClient _httpClient;
+        private readonly string _databricksWorkspaceUrl;
+        private readonly string _databricksToken;
+
+        public DatabricksRunJobHelper(string databricksToken, string databricksWorkspaceUrl)
+        {
+            _httpClient = new HttpClient();
+            _databricksToken = databricksToken;
+            _databricksWorkspaceUrl = databricksWorkspaceUrl;
+        }
+
+        public async Task<string?> RunJobAsync(string jobId, Dictionary<string, string>? Jobparameters = null)
+        {
+            Console.WriteLine("Running Databricks job...");
+
+            var runConfig = new
+            {
+                job_id = jobId,
+                job_parameters = Jobparameters
+            };
+
+            var requestUri = $"{_databricksWorkspaceUrl}/api/2.1/jobs/run-now";
+
+            var jsonContent = System.Text.Json.JsonSerializer.Serialize(runConfig);
+            var httpContent = new StringContent(jsonContent, Encoding.UTF8, "application/json");
+
+            _httpClient.DefaultRequestHeaders.Clear();
+            _httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _databricksToken);
+
+            try
+            {
+                var response = await _httpClient.PostAsync(requestUri, httpContent);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    Console.WriteLine("Job run started successfully!");
+
+                    Console.WriteLine("Job created successfully!");
+                    var responseBody = await response.Content.ReadAsStringAsync();
+                    var responseJson = System.Text.Json.JsonDocument.Parse(responseBody);
+                    var runId = responseJson.RootElement.GetProperty("run_id");
+                    return runId.ToString();
+                }
+                else
+                {
+                    Console.WriteLine("Failed to start job run.");
+                    Console.WriteLine($"Status Code: {response.StatusCode}");
+                    Console.WriteLine($"Response: {await response.Content.ReadAsStringAsync()}");
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error while running Databricks job: {ex.Message}");
+                throw;
+            }
+        }
+    }
+
+    public class DatabricksJobTaskHelper
+        {
+            private readonly HttpClient _httpClient;
+            private readonly string _databricksWorkspaceUrl;
+            private readonly string _databricksToken;
+
+            public DatabricksJobTaskHelper(string databricksToken, string databricksWorkspaceUrl)
+            {
+                _httpClient = new HttpClient();
+                _databricksToken = databricksToken;
+                _databricksWorkspaceUrl = databricksWorkspaceUrl;
+            }
+
+            public async Task<object?> GetJobTaskOutputAsync(string jobRunId)
+            {
+            Console.WriteLine($"Retrieving task for Job Run ID: {jobRunId}...");
+            if (!long.TryParse(jobRunId, out long jobRunIdLong))
+            {
+                throw new FormatException("Invalid Job Run ID format.");
+            }
+            var requestUri = $"{_databricksWorkspaceUrl}/api/2.1/jobs/runs/get?run_id={jobRunIdLong}";
+
+            _httpClient.DefaultRequestHeaders.Clear();
+                _httpClient.DefaultRequestHeaders.Authorization =
+                    new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _databricksToken);
+
+            try
+            {
+                var response = await _httpClient.GetAsync(requestUri);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    Console.WriteLine($"Failed to retrieve task. Status Code: {response.StatusCode}");
+                    Console.WriteLine($"Response: {await response.Content.ReadAsStringAsync()}");
+                    return null;
+                }
+
+                var responseBody = await response.Content.ReadAsStringAsync();
+                var runDetails = System.Text.Json.JsonSerializer.Deserialize<JsonElement>(responseBody);
+                //Console.WriteLine($"runDetails: {runDetails}"); //Entire Job Status and Details
+                if (runDetails.TryGetProperty("tasks", out JsonElement tasks) && tasks.GetArrayLength() > 0)
+                {
+                    // Get the first task in the array
+                    var firstTask = tasks[0];
+                    if (firstTask.TryGetProperty("run_id", out JsonElement runIdElement))
+                    {
+                        return await GetTaskRunOutputAsync(runIdElement.GetInt64().ToString());
+                    }  
+                }
+                else
+                {
+                    Console.WriteLine("Task run_id not found in the first task.");
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error while retrieving Task Id: {ex.Message}");
+                throw;
+            }
+            return null;
+        }
+
+            private async Task<object?> GetTaskRunOutputAsync(string taskRunId)
+            {
+                Console.WriteLine($"Retrieving output for Task Run ID: {taskRunId}...");
+            if (!long.TryParse(taskRunId, out long taskRunIdLong))
+            {
+                throw new FormatException("Invalid Job Run ID format.");
+            }
+
+            var requestUri = $"{_databricksWorkspaceUrl}/api/2.1/jobs/runs/get-output?run_id={taskRunIdLong}";
+
+                try
+                {
+                    var response = await _httpClient.GetAsync(requestUri);
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine($"Failed to retrieve task output. Status Code: {response.StatusCode}");
+                        Console.WriteLine($"Response: {await response.Content.ReadAsStringAsync()}");
+                        return null;
+                    }
+
+                var responseBody = await response.Content.ReadAsStringAsync();
+                var taskRunOutput = System.Text.Json.JsonSerializer.Deserialize<JsonElement>(responseBody);
+
+                var logs = taskRunOutput.TryGetProperty("logs", out var logsElement) ? logsElement.GetString() : null;
+                var metadata = taskRunOutput.TryGetProperty("metadata", out var metadataElement) ? metadataElement : default;
+                var resultState = metadata.TryGetProperty("state", out var stateElement) &&
+              stateElement.TryGetProperty("result_state", out var resultStateElement)
+              ? resultStateElement.GetString()
+              : null;
+                var lifecycleState = metadata.TryGetProperty("state", out var lifecycleElement) &&
+                                     lifecycleElement.TryGetProperty("life_cycle_state", out var lifecycleElementState)
+                                     ? lifecycleElementState.GetString()
+                                     : null;
+
+
+                Console.WriteLine($"Result State: {resultState}");
+                    Console.WriteLine($"Lifecycle State: {lifecycleState}");
+
+                    if (!string.IsNullOrEmpty(logs))
+                    {
+                        Console.WriteLine("Task Logs:");
+                        Console.WriteLine(logs);
+
+                        try
+                        {
+                            var schemaMatch = Regex.Match(logs, @"SourceAnalyzerDetectedSchema\[\[(.*?)\]\]", RegexOptions.Singleline);
+                            if (schemaMatch.Success)
+                            {
+                                string schemaStr = $"[{schemaMatch.Groups[1].Value}]";
+                            var schema = System.Text.Json.JsonSerializer.Deserialize<object>(schemaStr);
+                            Console.WriteLine($"Extracted Schema: {System.Text.Json.JsonSerializer.Serialize(schema, new System.Text.Json.JsonSerializerOptions { WriteIndented = true })}");
+                            return schema;
+                            }
+                            else
+                            {
+                                Console.WriteLine("No SourceAnalyzerDetectedSchema found in logs.");
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            Console.WriteLine($"Error processing logs: {e.Message}");
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("No logs available.");
+                    }
+
+                    return taskRunOutput;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error while retrieving task run output: {ex.Message}");
+                    throw;
+                }
+            }
+        }
 
 
 }
