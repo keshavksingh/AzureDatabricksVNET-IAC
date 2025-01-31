@@ -125,6 +125,13 @@ namespace VNET_IAC
             {
                 Console.WriteLine($"Failed to retrieve active Spark sessions. {activeSessions}");
             }
+
+            var sparkClusterHelper = new DatabricksListClustersHelper(databricksToken, databricksWorkspaceUrl);
+            int sparkClusterResp = await sparkClusterHelper.ListClustersAsync();
+            if (sparkClusterResp == -1)
+            {
+                Console.WriteLine($"Failed to retrieve Spark Clusters. {sparkClusterResp}");
+            }
         }
     }
 
@@ -766,6 +773,11 @@ namespace VNET_IAC
             var jobConfig = new
             {
                 name = "SparkJarJob",
+                max_concurrent_runs = 500,
+                queue = new 
+                {
+                    enabled = true 
+                },
                 tasks = new[]
                 {
             new
@@ -1109,6 +1121,84 @@ namespace VNET_IAC
             }
         }
     }
+    public class DatabricksListClustersHelper
+{
+    private readonly HttpClient _httpClient;
+    private readonly string _databricksWorkspaceUrl;
+    private readonly string _databricksToken;
+    private const int PageSize = 20; // Default number of clusters per request
+
+    public DatabricksListClustersHelper(string databricksToken, string databricksWorkspaceUrl)
+    {
+        _httpClient = new HttpClient();
+        _databricksToken = databricksToken;
+        _databricksWorkspaceUrl = databricksWorkspaceUrl;
+        _httpClient.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _databricksToken);
+    }
+
+    public async Task<int> ListClustersAsync()
+    {
+        try
+        {
+            List<JsonElement> allClusters = new List<JsonElement>();
+            string nextPageToken = null;
+
+            while (true)
+            {
+                string requestUrl = $"{_databricksWorkspaceUrl}/api/2.1/clusters/list?page_size={PageSize}";
+                if (!string.IsNullOrEmpty(nextPageToken))
+                {
+                    requestUrl += $"&page_token={nextPageToken}";
+                }
+                HttpResponseMessage response = await _httpClient.GetAsync(requestUrl);
+                if (!response.IsSuccessStatusCode)
+                {
+                    Console.WriteLine($"Error: {response.StatusCode}");
+                    return -1;
+                }
+                string jsonResponse = await response.Content.ReadAsStringAsync();
+                JsonDocument jsonDoc = JsonDocument.Parse(jsonResponse);
+
+                if (jsonDoc.RootElement.TryGetProperty("clusters", out JsonElement clustersElement))
+                {
+                    foreach (JsonElement cluster in clustersElement.EnumerateArray())
+                    {
+                        allClusters.Add(cluster);
+                    }
+                }
+
+                // Check for next page token
+                if (jsonDoc.RootElement.TryGetProperty("next_page_token", out JsonElement nextPageTokenElement))
+                {
+                    nextPageToken = nextPageTokenElement.GetString();
+                    if (string.IsNullOrEmpty(nextPageToken)) break; // No more pages
+                }
+                else
+                {
+                    break; // No pagination token means end of data
+                }
+            }
+
+            Console.WriteLine($"Fetched {allClusters.Count} clusters:");
+            foreach (var cluster in allClusters)
+            {
+                string clusterId = cluster.GetProperty("cluster_id").GetString();
+                string clusterName = cluster.GetProperty("cluster_name").GetString();
+                string sparkVersion = cluster.GetProperty("spark_version").GetString();
+
+                Console.WriteLine($"Cluster ID: {clusterId}, Name: {clusterName}, Spark Version: {sparkVersion}");
+            }
+
+            return allClusters.Count;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error fetching clusters: {ex.Message}");
+            return -1;
+        }
+    }
+}
 
 
 }
